@@ -1,6 +1,8 @@
 import torch
 from PIL import Image
 import numpy as np
+from torch.nn.functional import interpolate
+import math
 
 from comfy.k_diffusion import sampling
 from comfy.samplers import KSAMPLER
@@ -22,11 +24,17 @@ class LatentFFTAsImage:
         return (latent.sigmoid_(),)
 
 def dump_image(tensor):
+    if (tensor == tensor.flatten()[0]).all():
+        print("trivial dump")
+        return
+    tensor = tensor.to('cpu', copy=True)
     tensor -= tensor.min()
     tensor /= tensor.max()
-    n,h,w = tensor.shape
-    tensor = tensor[0].unsqueeze(-1).expand(h,w,3)
-    b = np.clip(tensor.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    if len(tensor.shape) == 3:
+        tensor = tensor.unsqueeze(1).expand(-1,3,-1,-1)
+    tensor = tensor.permute(0,2,3,1)[0]
+    h,w,c = tensor.shape
+    b = np.clip(tensor.numpy() * 255, 0, 255).astype(np.uint8)
     Image.fromarray(b).save("test.png")
 
 @torch.no_grad()
@@ -35,9 +43,13 @@ def sample_dynamic(model, x, sigmas, extra_args=None, callback=None, disable=Non
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     n,c,h,w = x.shape
-    kernel = torch.ones((4,1,h//4,w//4), dtype=x.dtype, device=x.device)
-    hist = torch.zeros(n,h-h//4+1,w-w//4+1, dtype=x.dtype, device=x.device)
-    base = x.clone()
+    hist = torch.zeros((n,h,w), device=x.device, dtype=x.dtype)
+    kx, ky = torch.meshgrid(torch.linspace(-h/2,h/2,h),torch.linspace(-w/2,w/2,w), indexing="ij")
+    base_mask = (kx*kx + ky*ky).sqrt().to(x.device)
+    cw = w-w//4+1
+    ch = h-h//4+1
+    kernel = torch.ones((1,1,h//4,w//4), dtype=x.dtype, device=x.device)
+    prev_denoised = None
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
         sigma_hat = sigmas[i] * (gamma + 1)
@@ -45,29 +57,56 @@ def sample_dynamic(model, x, sigmas, extra_args=None, callback=None, disable=Non
             eps = torch.randn_like(x) * s_noise
             x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
         denoised = model(x, sigma_hat * s_in, **extra_args)
+        #Most change is happening where magnitude of dt is greatest -> blur, find peak
+        maskl = (i/len(sigmas)*base_mask.max()-base_mask).clip(max=1,min=0).unsqueeze(0).unsqueeze(0)
+        maskh = ((i+1)/len(sigmas)*base_mask.max()-base_mask).clip(max=1,min=0).unsqueeze(0).unsqueeze(0)
+        mask = torch.fft.ifftshift(maskh*(1-maskl))
+        filt = torch.fft.ifft2(mask*torch.fft.fft2(denoised)).real
+        if prev_denoised is not None:
+            ext = prev_denoised+filt-denoised
+            dist = (ext*ext).sum(1)/-dt
+            hist+= dist
+            summed = torch.nn.functional.conv2d(dist, kernel, groups=1)
+            focal = torch.unravel_index(summed.view((n,ch*cw)).argmax(1), (ch,cw))
+            focal = torch.stack(focal).transpose(0,1)
+            sublocs = []
+            subinds = []
+            focalm = []
+            for j,ind in enumerate(focal):
+                focalm.append(summed[j, *ind])
+                if summed[j, *ind] > 1000:
+                    subx = x[j,:,ind[0]:ind[0]+h//4,ind[1]:ind[1]+w//4]
+                    #scale+noise subx
+                    sublocs.append(subx)
+                    subinds.append(j)
+            if len(sublocs) > 0:
+                subx = torch.stack(sublocs)
+                #subx = subx.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
+                subx = interpolate(subx, size=(h//2,w//2))
+                subx += torch.randn_like(subx)*(1-math.sqrt(2))*sigma_hat*s_in
+                print("doing subrender")
+                subdn = model(subx, sigma_hat*s_in*math.sqrt(2), **extra_args)
+                #downscale
+                subdn = interpolate(subdn, size=(h//4,w//4))
+                #TODO: Does added noise need to be filtered out?
+                for j,dn in zip(subinds,subdn):
+                    subx = denoised[j,:,focal[j][0]:focal[j][0]+h//4,focal[j][1]:focal[j][1]+w//4]
+                    subx += 2*dn
+                    subx /= 3
+            focal[:,0] += h//8
+            focal[:,1] += w//8
+            print(focal*8)
+            print(focalm)
+        prev_denoised = denoised
         d = sampling.to_d(x, sigma_hat, denoised)
+
         if callback is not None:
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
         dt = sigmas[i + 1] - sigma_hat
-        #Most change is happening where magnitude of dt is greatest -> blur, find peak
-        summed = torch.nn.functional.conv2d(d, kernel, groups=4)
-        _,_,ch,cw = summed.shape
-        dist = (summed*summed).sum(1).sqrt()
-        hist += dist
-        focal = torch.unravel_index(hist.view((n,ch*cw)).argmax(1), (ch,cw))
-        focal = torch.stack(focal)
-        print(float(hist[0, *focal.transpose(0,1)[0]]))
-        focal[0] += h//8
-        focal[1] += w//8
-        print(focal.transpose(0,1) * 8)
-
         # Euler method
         x = x + d * dt
-    dif = x-base
-    dif = (dif*dif).sum(1).sqrt()*0
-    dif[:,h//8:7*h//8+1, w//8:7*w//8+1] -= hist
-    dif = (-dif).clip(min=0)
-    dump_image(dif)
+    summed = torch.nn.functional.conv2d(hist, kernel, groups=1)
+    dump_image(hist)
     return x
 
 class DynamicSampler:
