@@ -50,6 +50,7 @@ def sample_dynamic(model, x, sigmas, extra_args=None, callback=None, disable=Non
     ch = h-h//4+1
     kernel = torch.ones((1,1,h//4,w//4), dtype=x.dtype, device=x.device)
     prev_denoised = None
+    early_terminate = False
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
         sigma_hat = sigmas[i] * (gamma + 1)
@@ -80,19 +81,24 @@ def sample_dynamic(model, x, sigmas, extra_args=None, callback=None, disable=Non
                     sublocs.append(subx)
                     subinds.append(j)
             if len(sublocs) > 0:
+                early_terminate = True
                 subx = torch.stack(sublocs)
                 #subx = subx.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
-                subx = interpolate(subx, size=(h//2,w//2))
+                subx = interpolate(subx, size=(h//2,w//2), mode='bicubic')
                 subx += torch.randn_like(subx)*(1-math.sqrt(2))*sigma_hat*s_in
                 print("doing subrender")
                 subdn = model(subx, sigma_hat*s_in*math.sqrt(2), **extra_args)
                 #downscale
-                subdn = interpolate(subdn, size=(h//4,w//4))
+                subdn = interpolate(subdn, size=(h//4,w//4), mode='bicubic')
                 #TODO: Does added noise need to be filtered out?
                 for j,dn in zip(subinds,subdn):
                     subx = denoised[j,:,focal[j][0]:focal[j][0]+h//4,focal[j][1]:focal[j][1]+w//4]
-                    subx += 2*dn
-                    subx /= 3
+                    sub_weight = -1
+                    if sub_weight == -1:
+                        subx[:] = dn
+                    else:
+                        subx[:] += sub_weight*dn
+                        subx /= sub_weight+1
             focal[:,0] += h//8
             focal[:,1] += w//8
             print(focal*8)
@@ -105,6 +111,8 @@ def sample_dynamic(model, x, sigmas, extra_args=None, callback=None, disable=Non
         dt = sigmas[i + 1] - sigma_hat
         # Euler method
         x = x + d * dt
+        if early_terminate:
+            break
     summed = torch.nn.functional.conv2d(hist, kernel, groups=1)
     dump_image(hist)
     return x
