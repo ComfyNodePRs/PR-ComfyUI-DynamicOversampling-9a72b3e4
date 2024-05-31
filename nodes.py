@@ -122,7 +122,81 @@ class DynamicSampler:
     def get_sampler(self, sub_weight, early_terminate, resolution_mult):
         return (KSAMPLER(lambda *args, **kwargs: sample_dynamic(*args, sub_weight=sub_weight, early_terminate=early_terminate, resolution_mult=resolution_mult, **kwargs)),)
 
+class MeasuredSampler(KSAMPLER):
+    def __init__(self, sampler):
+        self.sampler = sampler.sampler_function
+        self.prev_denoised = None
+        self.prev_sigma = 0
+        super().__init__(self.wrapped_sample)
+    def wrapped_sample(self, *args, **kwargs):
+        original_callback = kwargs.get("callback", None)
+        def callback(args):
+            self.callback(args)
+            if original_callback is not None:
+                original_callback(args)
+        self.sigmas = args[2]
+        self.steps = len(args[2])
+        kwargs["callback"] = callback
+        x = args[1]
+        n,c,h,w = x.shape
+        self.hist = torch.zeros((n,h,w), device=x.device, dtype=torch.float32)
+        kx, ky = torch.meshgrid(torch.linspace(-h/2,h/2,h),torch.linspace(-w/2,w/2,w), indexing="ij")
+        self.base_mask = (kx*kx + ky*ky).sqrt().to(x.device)
+        self.prev_denoised = None
+        x =  self.sampler(*args, **kwargs)
+        return x
+
+    def callback(self, args):
+        denoised = args["denoised"]
+        i = args["i"]
+        dt = self.sigmas[i+1] - args['sigma_hat']
+        if self.prev_denoised is not None:
+            maskl = (i/self.steps*self.base_mask.max()-self.base_mask).clip(max=1,min=0).unsqueeze(0).unsqueeze(0)
+            maskh = ((i+1)/self.steps*self.base_mask.max()-self.base_mask).clip(max=1,min=0).unsqueeze(0).unsqueeze(0)
+            #A filter of where changes are expected
+            mask = torch.fft.ifftshift(maskh*(1-maskl))
+            #Just the expected changes
+            filt = torch.fft.ifft2(mask*torch.fft.fft2(denoised)).real
+            #changes made outside the current sigma schedule
+            ext = self.prev_denoised+filt-denoised
+            #The distance of changes relative to the current step
+            dist = (ext*ext).sum(1)/math.sqrt(-dt)
+            self.hist+= dist
+        self.prev_denoised = denoised
+
+class MeasuredSamplerNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"sampler": ("SAMPLER",),}}
+    RETURN_TYPES = ("SAMPLER", "MASK_PROMISE")
+    CATEGORY = "sampling/custom_sampling/samplers"
+
+    FUNCTION = "get_sampler"
+    def get_sampler(self, sampler):
+        s = MeasuredSampler(sampler)
+        return (s, s)
+
+class ResolveMaskPromise:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"latent": ("LATENT",), "mask_promise": ("MASK_PROMISE",),
+                             "upper_threshold": ("FLOAT", {"default": .8, "step": .01, "min": 0, "max": 1}),
+                             "lower_threshold": ("FLOAT", {"default": .2, "step": .01, "min": 0, "max": 1}),}}
+    RETURN_TYPES = ("MASK",)
+
+    FUNCTION = "get_mask"
+    def get_mask(self, latent, mask_promise, lower_threshold, upper_threshold):
+        #NOTE: latent is only used to ensure this executes after sampling
+        hist = mask_promise.hist
+        sorted_hist = hist.flatten(start_dim=1).sort().values
+        lower = sorted_hist[:,int((sorted_hist.size(1)-1)*lower_threshold)]
+        upper = sorted_hist[:,int((sorted_hist.size(1)-1)*upper_threshold)]
+        mask = ((hist-lower)/(upper-lower)).clip(max=1, min=0)
+        return (mask.cpu(),)
+
 NODE_CLASS_MAPPINGS = {
     "DynamicSampler": DynamicSampler,
+    "MeasuredSampler": MeasuredSamplerNode,
+    "ResolveMaskPromise": ResolveMaskPromise,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {}
