@@ -164,6 +164,20 @@ class MeasuredSampler(KSAMPLER):
             self.hist+= dist
         self.prev_denoised = denoised
 
+#Blur functions borrowed from comfy_extras/nodes_post_processing
+#with slight modifications
+def gaussian_blur(latents, sigma=1):
+    radius = min(latents.shape[2:])//2
+    size = radius*2+1
+    maxl = size // 2
+    x, y = torch.meshgrid(torch.linspace(-maxl, maxl, size), torch.linspace(-maxl, maxl, size), indexing="ij")
+    d = (x * x + y * y) / (2 * sigma * sigma)
+    mask =  torch.exp(-d) / (2 * torch.pi * sigma * sigma)
+    kernel = (mask / mask.sum())[None, None].to(latents.device)
+    padded_latents = torch.nn.functional.pad(latents, [radius]*4, 'reflect')
+    blurred = torch.nn.functional.conv2d(padded_latents, kernel, padding=(radius*2+1) // 2, groups=1)
+    return blurred[:, :, radius:-radius, radius:-radius]
+
 class MeasuredSamplerNode:
     @classmethod
     def INPUT_TYPES(s):
@@ -181,13 +195,16 @@ class ResolveMaskPromise:
     def INPUT_TYPES(s):
         return {"required": {"latent": ("LATENT",), "mask_promise": ("MASK_PROMISE",),
                              "upper_threshold": ("FLOAT", {"default": .8, "step": .01, "min": 0, "max": 1}),
-                             "lower_threshold": ("FLOAT", {"default": .2, "step": .01, "min": 0, "max": 1}),}}
+                             "lower_threshold": ("FLOAT", {"default": .2, "step": .01, "min": 0, "max": 1}),
+                             "blur_sigma": ("FLOAT", {"default": 0, "min": 0, "step": .01}),}}
     RETURN_TYPES = ("MASK",)
 
     FUNCTION = "get_mask"
-    def get_mask(self, latent, mask_promise, lower_threshold, upper_threshold):
+    def get_mask(self, latent, mask_promise, lower_threshold, upper_threshold, blur_sigma):
         #NOTE: latent is only used to ensure this executes after sampling
         hist = mask_promise.hist
+        if blur_sigma > 0:
+            hist = gaussian_blur(hist.unsqueeze(1), blur_sigma).squeeze(1)
         sorted_hist = hist.flatten(start_dim=1).sort().values
         lower = sorted_hist[:,int((sorted_hist.size(1)-1)*lower_threshold)]
         upper = sorted_hist[:,int((sorted_hist.size(1)-1)*upper_threshold)]
