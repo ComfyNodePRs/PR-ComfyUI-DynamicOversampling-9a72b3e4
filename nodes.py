@@ -206,8 +206,8 @@ class ResolveMaskPromise:
         if blur_sigma > 0:
             hist = gaussian_blur(hist.unsqueeze(1), blur_sigma).squeeze(1)
         sorted_hist = hist.flatten(start_dim=1).sort().values
-        lower = sorted_hist[:,int((sorted_hist.size(1)-1)*lower_threshold)]
-        upper = sorted_hist[:,int((sorted_hist.size(1)-1)*upper_threshold)]
+        lower = sorted_hist[:,int((sorted_hist.size(1)-1)*lower_threshold)][:,None,None]
+        upper = sorted_hist[:,int((sorted_hist.size(1)-1)*upper_threshold)][:,None,None]
         mask = ((hist-lower)/(upper-lower)).clip(max=1, min=0)
         return (mask.cpu(),)
 
