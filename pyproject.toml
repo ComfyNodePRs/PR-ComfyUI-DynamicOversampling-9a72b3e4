@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-dynamicoversampling"
+description = "Nodes:DynamicSampler, MeasuredSampler, ResolveMaskPromise"
+version = "1.0.0"
+license = "LICENSE"
+
+[project.urls]
+Repository = "https://github.com/AustinMroz/ComfyUI-DynamicOversampling"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-DynamicOversampling"
+Icon = ""
